@@ -253,12 +253,90 @@ async def on_error(request, exc):
     return JSONResponse(status_code=500, content={"error": str(exc)})
 
 
+def _ensure_port_free(host: str, port: int) -> None:
+    """
+    Make sure ``port`` is bindable before uvicorn starts.
+
+    If a *stale instance of this same app* is still holding the port
+    (a previous run that never shut down), it is terminated automatically.
+    If some unrelated program owns the port, a clear message is printed
+    instead of the cryptic ``[Errno 10048]`` bind error.
+    """
+    import os
+    import socket
+
+    # Quick check: can we bind right now?
+    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        probe.bind((host if host != "0.0.0.0" else "", port))
+        return                                   # port is free — nothing to do
+    except OSError:
+        pass
+    finally:
+        probe.close()
+
+    try:
+        import psutil
+    except ImportError:
+        print(f"[main] port {port} is busy and psutil is not installed — "
+              f"close whatever is using it, or change system.port in config.")
+        return
+
+    me = os.getpid()
+    killed = False
+    for conn in psutil.net_connections(kind="inet"):
+        if (conn.laddr and conn.laddr.port == port
+                and conn.status == psutil.CONN_LISTEN and conn.pid):
+            if conn.pid == me:
+                continue
+            try:
+                proc = psutil.Process(conn.pid)
+                cmdline = " ".join(proc.cmdline())
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+            # Only auto-kill a leftover copy of *this* app.
+            if "backend.main" in cmdline or "backend.main:app" in cmdline:
+                print(f"[main] port {port} held by stale instance "
+                      f"(pid {conn.pid}) — terminating it.")
+                try:
+                    proc.terminate()
+                    proc.wait(timeout=5)
+                except psutil.TimeoutExpired:
+                    proc.kill()
+                except psutil.NoSuchProcess:
+                    pass
+                killed = True
+            else:
+                print(f"[main] port {port} is in use by another program "
+                      f"(pid {conn.pid}: {cmdline or proc.name()}).\n"
+                      f"       Stop that program or change 'system.port' "
+                      f"in your config, then run again.")
+
+    if killed:
+        # Windows leaves the socket in TIME_WAIT briefly after the kill.
+        for _ in range(20):
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            try:
+                s.bind((host if host != "0.0.0.0" else "", port))
+                s.close()
+                print(f"[main] port {port} is free again.")
+                return
+            except OSError:
+                s.close()
+                time.sleep(0.25)
+        print(f"[main] port {port} still busy after cleanup — retrying anyway.")
+
+
 if __name__ == "__main__":
     import uvicorn
 
+    _host = CONFIG.get_path("system.host", "0.0.0.0")
+    _port = int(CONFIG.get_path("system.port", 8000))
+    _ensure_port_free(_host, _port)
+
     uvicorn.run(
         "backend.main:app",
-        host=CONFIG.get_path("system.host", "0.0.0.0"),
-        port=int(CONFIG.get_path("system.port", 8000)),
+        host=_host,
+        port=_port,
         reload=False,
     )

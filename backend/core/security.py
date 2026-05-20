@@ -74,13 +74,17 @@ def decrypt_value(value: str | None) -> str | None:
 def build_rtsp_url(url: str, port=None, username: str | None = None,
                    password: str | None = None) -> str | None:
     """
-    Build a connectable stream URL.
+    Build a connectable stream URL.  Ported from cctv-management `_build_url`.
 
-    * `url` already a full URL (`rtsp://`, `http://`...) or a webcam
-      index (a plain digit) -> returned unchanged.
-    * otherwise `url` is treated as `host` or `host/path`; the username
-      and password are percent-encoded and the URL is assembled as
-      `rtsp://user:pass@host:port/path`.
+    * `url` is already a full URL (`rtsp://`, `http://`...) or a webcam
+      index (a plain digit) → returned unchanged.
+    * Otherwise `url` is treated as `host` or `host/path`; the username
+      and password are percent-encoded (@ → %40, : → %3A, etc.) and
+      assembled as `rtsp://user:pass@host:port/path`.
+
+    Special characters in credentials (like @, :, %) MUST be
+    percent-encoded so the URL parser does not mis-read them as
+    delimiters.  `urllib.parse.quote(safe="")` handles this correctly.
     """
     if not url:
         return None
@@ -96,10 +100,12 @@ def build_rtsp_url(url: str, port=None, username: str | None = None,
         host, rest = url.split("/", 1)
         path = "/" + rest
 
-    # Credentials — only added when BOTH parts are present.
+    # Percent-encode credentials — safe="" encodes ALL special chars.
     auth = ""
     if username and password:
-        auth = f"{quote(username, safe='')}:{quote(password, safe='')}@"
+        safe_user = quote(username, safe="")
+        safe_pass = quote(password, safe="")
+        auth = f"{safe_user}:{safe_pass}@"
 
     cam_port = f":{port}" if port else ":554"
     return f"rtsp://{auth}{host}{cam_port}{path}"

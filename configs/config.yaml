@@ -6,6 +6,7 @@ system:
   host: "0.0.0.0"
   port: 8000
   database_url: "sqlite:///./intrusion.db"   # or postgresql://user:pass@host/db
+  public_url: ""                              # Optional: e.g. "https://xxxx.ngrok-free.app" to send image alerts to WhatsApp
   snapshot_dir: "./snapshots"
   recording_dir: "./recordings"
   model_dir: "./models"
@@ -55,8 +56,8 @@ tracking:
 pipeline:
   target_fps: 30              # processing FPS cap per camera
   frame_skip: "auto"          # auto | 0 | 1 | 2 ... (drop frames if slow)
-  rtsp_transport: "tcp"       # tcp (reliable) | udp (low latency)
-  rtsp_timeout: 8             # seconds — connection/read timeout (no hangs)
+  # rtsp_transport is handled automatically: TCP is tried first, then UDP.
+  rtsp_timeout: 8             # seconds — socket timeout per connection attempt
   reconnect_delay: 5          # seconds before retrying a dropped stream
 
 # ── Alerts ───────────────────────────────────────────────────────────

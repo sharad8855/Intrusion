@@ -75,44 +75,68 @@
 
       <div class="card">
         <h3>New Camera</h3>
+
+        <!-- Mode toggle -->
+        <div class="seg" id="cam-mode-toggle" style="margin-bottom:16px;display:inline-flex">
+          <button class="seg-btn active" data-mode="ip" id="mode-ip">IP + Credentials</button>
+          <button class="seg-btn" data-mode="full" id="mode-full">Full RTSP URL</button>
+        </div>
+
         <form id="camera-form" class="form-grid">
-          <label>Camera name
-            <input name="name" placeholder="e.g. Main Gate" required />
+          <label>Camera Name
+            <input name="name" id="cam-name" placeholder="e.g. Main Gate" required />
           </label>
-          <label class="wide">IP Address / RTSP URL
-            <input name="url" required
-                   placeholder="192.168.2.99/stream1   — or —   rtsp://admin:Baap%40123@192.168.2.99:554/stream1" />
+
+          <!-- ── IP MODE fields ── -->
+          <div id="ip-mode-fields" style="display:contents">
+            <label>IP Address
+              <input name="host" id="cam-host" placeholder="192.168.2.108" />
+            </label>
+            <label>Port
+              <input name="port" id="cam-port" placeholder="554  (use 80 or 8554 if default fails)" />
+            </label>
+            <label>Username
+              <input name="username" id="cam-user" placeholder="admin" />
+            </label>
+            <label>Password
+              <input name="password" id="cam-pass" type="password" placeholder="your camera password" />
+            </label>
+          </div>
+
+          <!-- ── FULL URL MODE field ── -->
+          <label id="full-url-field" class="wide" style="display:none">Full RTSP URL
+            <input name="url" id="cam-url"
+                   placeholder="rtsp://admin:pass%40word@192.168.2.108:554/stream1" />
+            <small style="color:var(--muted);font-size:11px;margin-top:4px;display:block">
+              Encode special chars in password: @ &rarr; %40 &nbsp;|&nbsp; # &rarr; %23
+            </small>
           </label>
-          <label>Port
-            <input name="port" placeholder="554" />
-          </label>
-          <label>Username
-            <input name="username" placeholder="admin" />
-          </label>
-          <label>Password
-            <input name="password" type="password" placeholder="Baap@123" />
-          </label>
-          <label>Latitude
-            <input name="latitude" placeholder="optional" />
-          </label>
-          <label>Longitude
-            <input name="longitude" placeholder="optional" />
-          </label>
-          <button type="submit" class="btn primary">+ Add Camera</button>
+
+          <!-- optional geo -->
+          <label>Latitude <input name="latitude" placeholder="optional" /></label>
+          <label>Longitude <input name="longitude" placeholder="optional" /></label>
+
+          <button type="submit" class="btn primary" id="cam-submit">+ Add Camera</button>
         </form>
-        <p class="hint">
-          The <b>IP Address / RTSP URL</b> field is smart — enter a full
-          <code>rtsp://…</code> URL, a host with a path
-          (<code>192.168.2.99/stream1</code>), or <code>0</code> for a local
-          webcam. Username &amp; password are encoded automatically.
-        </p>
+
+        <div class="hint" style="margin-top:12px">
+          <b>IP + Credentials mode</b>: Enter the camera's IP address, RTSP port
+          (usually <code>554</code>, sometimes <code>80</code> or <code>8554</code>),
+          username and password. The RTSP URL is built and special chars are encoded
+          automatically — never hardcode credentials in a URL.<br/><br/>
+          <b>Full URL mode</b>: Paste a complete <code>rtsp://</code> URL directly.
+          Use this if your camera requires a specific stream path.
+        </div>
       </div>
 
       <div class="card">
         <h3>Configured Cameras</h3>
-        <table class="data-table">
+        <table class="data-table" id="cam-table">
           <thead>
-            <tr><th>ID</th><th>Name</th><th>Status</th><th>FPS</th><th>Actions</th></tr>
+            <tr>
+              <th>ID</th><th>Name</th><th>IP / Host</th>
+              <th>Status</th><th>FPS</th><th>Actions</th>
+            </tr>
           </thead>
           <tbody id="camera-rows"></tbody>
         </table>

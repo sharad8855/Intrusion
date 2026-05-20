@@ -34,7 +34,10 @@ function showView(view) {
   );
   if (view === "live")    renderLive();
   if (view === "cameras") renderCameras();
-  if (view === "rules")   renderRules();
+  if (view === "rules") {
+    renderRules();
+    setTimeout(syncCanvas, 100);
+  }
   if (view === "alerts")  loadAlerts();
 }
 
@@ -106,16 +109,50 @@ $("live-refresh").addEventListener("click", () => {
 });
 
 /* ───────────────── ADD CAMERAS ───────────────── */
+
+/* ── Mode toggle: IP+Credentials vs Full RTSP URL ── */
+let _camMode = "ip";  // "ip" | "full"
+
+$("cam-mode-toggle").addEventListener("click", (e) => {
+  const btn = e.target.closest(".seg-btn");
+  if (!btn) return;
+  _camMode = btn.dataset.mode;
+  $$("#cam-mode-toggle .seg-btn").forEach(b => b.classList.remove("active"));
+  btn.classList.add("active");
+
+  // Show/hide the right set of fields
+  const ipFields  = $("ip-mode-fields").querySelectorAll("label");
+  const fullField = $("full-url-field");
+
+  if (_camMode === "ip") {
+    ipFields.forEach(l => { l.style.display = ""; });
+    fullField.style.display = "none";
+    // Clear full URL input to avoid confusion
+    $("cam-url").value = "";
+  } else {
+    ipFields.forEach(l => { l.style.display = "none"; });
+    fullField.style.display = "";
+    // Clear IP fields
+    $("cam-host").value = "";
+    $("cam-port").value = "";
+    $("cam-user").value = "";
+    $("cam-pass").value = "";
+  }
+});
+
 async function renderCameras() {
   await refreshSystem();
   await refreshCameras();
   $("camera-rows").innerHTML = cameras
     .map((c) => {
-      const p = pipelines[c.id] || {};
+      const p      = pipelines[c.id] || {};
       const status = p.status || c.status || "offline";
+      // Show host/IP stored in the url field (no credentials exposed)
+      const hostDisplay = c.url || "—";
       return `<tr>
         <td>${c.id}</td>
         <td>${c.name}</td>
+        <td style="font-family:monospace;font-size:12px">${hostDisplay}</td>
         <td class="status-${status}">${status}</td>
         <td>${p.fps != null ? p.fps.toFixed(1) : "—"}</td>
         <td>
@@ -128,7 +165,7 @@ async function renderCameras() {
       </tr>`;
     })
     .join("") ||
-    `<tr><td colspan="5" style="color:var(--muted)">No cameras configured.</td></tr>`;
+    `<tr><td colspan="6" style="color:var(--muted)">No cameras configured.</td></tr>`;
 }
 
 $("camera-rows").addEventListener("click", async (e) => {
@@ -158,25 +195,54 @@ $("camera-rows").addEventListener("click", async (e) => {
 $("camera-form").addEventListener("submit", async (e) => {
   e.preventDefault();
   const fd = new FormData(e.target);
+
+  // Build the payload depending on which mode the user is in.
+  let payload;
+  if (_camMode === "ip") {
+    const host = (fd.get("host") || "").trim();
+    if (!host) { alert("IP Address is required."); return; }
+    payload = {
+      name:      (fd.get("name") || host).trim(),
+      url:       host,                              // just the host — backend builds RTSP URL
+      port:      (fd.get("port") || "").trim() || null,
+      username:  (fd.get("username") || "").trim() || null,
+      password:  fd.get("password") || null,        // stored encrypted in DB
+      latitude:  parseFloat(fd.get("latitude")) || null,
+      longitude: parseFloat(fd.get("longitude")) || null,
+      enabled:   true,
+    };
+  } else {
+    // Full URL mode — user pasted a complete rtsp:// URL
+    const fullUrl = (fd.get("url") || "").trim();
+    if (!fullUrl) { alert("RTSP URL is required."); return; }
+    payload = {
+      name:      (fd.get("name") || fullUrl).trim(),
+      url:       fullUrl,       // full URL stored verbatim; build_rtsp returns it as-is
+      port:      null,
+      username:  null,
+      password:  null,
+      latitude:  parseFloat(fd.get("latitude")) || null,
+      longitude: parseFloat(fd.get("longitude")) || null,
+      enabled:   true,
+    };
+  }
+
+  const btn = $("cam-submit");
+  btn.disabled = true;
+  btn.textContent = "Adding...";
   try {
     await api("/api/cameras", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        name: fd.get("name"),
-        url: fd.get("url"),
-        port: fd.get("port") || null,
-        username: fd.get("username") || null,
-        password: fd.get("password") || null,
-        latitude: parseFloat(fd.get("latitude")) || null,
-        longitude: parseFloat(fd.get("longitude")) || null,
-        enabled: true,
-      }),
+      body: JSON.stringify(payload),
     });
     e.target.reset();
+    btn.textContent = "+ Add Camera";
     renderCameras();
   } catch (err) {
     alert("Error: " + err.message);
+    btn.disabled = false;
+    btn.textContent = "+ Add Camera";
   }
 });
 
@@ -184,6 +250,7 @@ $("camera-form").addEventListener("submit", async (e) => {
 let drawMode = "none";
 let drawPoints = [];           // canvas display-space points
 let polyClosed = false;
+let mousePos = null;           // tracks interactive mouse preview point
 
 const feed = $("feed");
 const overlay = $("overlay");
@@ -216,6 +283,8 @@ function loadStream(camId) {
   feed.src = `/api/cameras/${camId}/stream?t=${Date.now()}`;
   resetDraw();
   loadZones();
+  syncCanvas();
+  setTimeout(syncCanvas, 100);
 }
 
 /* draw tool selector */
@@ -240,13 +309,20 @@ $("clear-draw").addEventListener("click", resetDraw);
 function resetDraw() {
   drawPoints = [];
   polyClosed = false;
-  redraw();
+  mousePos = null;
+  syncCanvas();
 }
 
 /* keep canvas pixel size synced to the displayed image */
 function syncCanvas() {
-  overlay.width = feed.clientWidth;
-  overlay.height = feed.clientHeight;
+  const stage = $("stage");
+  const w = feed.clientWidth || (stage ? stage.clientWidth : 0) || 920;
+  const h = feed.clientHeight || (stage ? stage.clientHeight : 0) || 517;
+  
+  if (overlay.width !== w || overlay.height !== h) {
+    overlay.width = w;
+    overlay.height = h;
+  }
   redraw();
 }
 window.addEventListener("resize", syncCanvas);
@@ -254,8 +330,8 @@ feed.addEventListener("load", syncCanvas);
 
 /* map a canvas display point to native image pixels */
 function toNative(pt) {
-  const sx = (feed.naturalWidth || feed.clientWidth) / feed.clientWidth;
-  const sy = (feed.naturalHeight || feed.clientHeight) / feed.clientHeight;
+  const sx = (feed.naturalWidth || feed.clientWidth || 1) / (feed.clientWidth || 1);
+  const sy = (feed.naturalHeight || feed.clientHeight || 1) / (feed.clientHeight || 1);
   return [Math.round(pt[0] * sx), Math.round(pt[1] * sy)];
 }
 
@@ -273,9 +349,33 @@ overlay.addEventListener("click", (e) => {
   redraw();
 });
 
+overlay.addEventListener("mousemove", (e) => {
+  if (drawMode === "none" || drawPoints.length === 0 || polyClosed) {
+    mousePos = null;
+    return;
+  }
+  const r = overlay.getBoundingClientRect();
+  mousePos = [e.clientX - r.left, e.clientY - r.top];
+  redraw();
+});
+
+overlay.addEventListener("mouseleave", () => {
+  mousePos = null;
+  redraw();
+});
+
 overlay.addEventListener("dblclick", () => {
   if (drawMode === "polygon" && drawPoints.length >= 3) {
+    // If the last point is extremely close to the second-to-last point (from the double click event), pop it.
+    if (drawPoints.length > 3) {
+      const last = drawPoints[drawPoints.length - 1];
+      const prev = drawPoints[drawPoints.length - 2];
+      if (dist(last, prev) < 6) {
+        drawPoints.pop();
+      }
+    }
     polyClosed = true;
+    mousePos = null;
     redraw();
   }
 });
@@ -306,6 +406,28 @@ function redraw() {
     drawPoints.slice(1).forEach((p) => ctx.lineTo(...p));
     if (polyClosed) ctx.closePath();
     ctx.stroke();
+  }
+
+  // Draw interactive guide/preview while drawing
+  if (mousePos && !polyClosed) {
+    ctx.save();
+    ctx.setLineDash([6, 4]);
+    ctx.strokeStyle = "rgba(45, 212, 191, 0.65)";
+    if (drawMode === "line" && drawPoints.length === 1) {
+      line(ctx, drawPoints[0], mousePos);
+    } else if (drawMode === "circle" && drawPoints.length === 1) {
+      const rad = dist(drawPoints[0], mousePos);
+      ctx.beginPath();
+      ctx.arc(drawPoints[0][0], drawPoints[0][1], rad, 0, Math.PI * 2);
+      ctx.stroke();
+    } else if (drawMode === "polygon" && drawPoints.length >= 1) {
+      ctx.beginPath();
+      ctx.moveTo(...drawPoints[0]);
+      drawPoints.slice(1).forEach((p) => ctx.lineTo(...p));
+      ctx.lineTo(...mousePos);
+      ctx.stroke();
+    }
+    ctx.restore();
   }
 }
 const dist = (a, b) => Math.hypot(b[0] - a[0], b[1] - a[1]);
