@@ -1,0 +1,179 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AI Intrusion & Virtual Tripwire System</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+<div class="app">
+
+  <!-- ════════════ SIDEBAR ════════════ -->
+  <aside class="sidebar">
+    <div class="brand">
+      <span class="brand-icon">🛡️</span>
+      <div>
+        <strong>Tripwire AI</strong>
+        <small>Intrusion Detection</small>
+      </div>
+    </div>
+
+    <nav class="nav">
+      <button class="nav-item active" data-view="live">
+        <span class="ni-icon">📹</span> Live Streaming
+      </button>
+      <button class="nav-item" data-view="cameras">
+        <span class="ni-icon">➕</span> Add Cameras
+      </button>
+      <button class="nav-item" data-view="rules">
+        <span class="ni-icon">📐</span> Lines &amp; Rules
+      </button>
+      <button class="nav-item" data-view="alerts">
+        <span class="ni-icon">🚨</span> Alerts
+        <span id="alert-count" class="pill">0</span>
+      </button>
+    </nav>
+
+    <div class="sidebar-footer">
+      <div class="device-card">
+        <span class="dot" id="device-dot"></span>
+        <div>
+          <small>Compute device</small>
+          <strong id="device-name">detecting…</strong>
+        </div>
+      </div>
+    </div>
+  </aside>
+
+  <!-- ════════════ CONTENT ════════════ -->
+  <main class="content">
+
+    <!-- ──────── VIEW: LIVE STREAMING ──────── -->
+    <section id="view-live" class="view active">
+      <header class="view-head">
+        <div>
+          <h1>Live Streaming</h1>
+          <p>Real-time AI monitoring of all active cameras.</p>
+        </div>
+        <button class="btn ghost" id="live-refresh">⟳ Refresh</button>
+      </header>
+      <div id="live-grid" class="camera-grid"></div>
+      <div id="live-empty" class="empty">
+        No cameras running. Add one in <b>Add Cameras</b>.
+      </div>
+    </section>
+
+    <!-- ──────── VIEW: ADD CAMERAS ──────── -->
+    <section id="view-cameras" class="view">
+      <header class="view-head">
+        <div>
+          <h1>Add Cameras</h1>
+          <p>Connect and manage IP / CCTV camera streams.</p>
+        </div>
+      </header>
+
+      <div class="card">
+        <h3>New Camera</h3>
+        <form id="camera-form" class="form-grid">
+          <label>Camera name
+            <input name="name" placeholder="e.g. Main Gate" required />
+          </label>
+          <label class="wide">IP Address / RTSP URL
+            <input name="url" required
+                   placeholder="192.168.2.99/stream1   — or —   rtsp://admin:Baap%40123@192.168.2.99:554/stream1" />
+          </label>
+          <label>Port
+            <input name="port" placeholder="554" />
+          </label>
+          <label>Username
+            <input name="username" placeholder="admin" />
+          </label>
+          <label>Password
+            <input name="password" type="password" placeholder="Baap@123" />
+          </label>
+          <label>Latitude
+            <input name="latitude" placeholder="optional" />
+          </label>
+          <label>Longitude
+            <input name="longitude" placeholder="optional" />
+          </label>
+          <button type="submit" class="btn primary">+ Add Camera</button>
+        </form>
+        <p class="hint">
+          The <b>IP Address / RTSP URL</b> field is smart — enter a full
+          <code>rtsp://…</code> URL, a host with a path
+          (<code>192.168.2.99/stream1</code>), or <code>0</code> for a local
+          webcam. Username &amp; password are encoded automatically.
+        </p>
+      </div>
+
+      <div class="card">
+        <h3>Configured Cameras</h3>
+        <table class="data-table">
+          <thead>
+            <tr><th>ID</th><th>Name</th><th>Status</th><th>FPS</th><th>Actions</th></tr>
+          </thead>
+          <tbody id="camera-rows"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- ──────── VIEW: LINES & RULES ──────── -->
+    <section id="view-rules" class="view">
+      <header class="view-head">
+        <div>
+          <h1>Lines &amp; Rules</h1>
+          <p>Draw tripwire lines, circular zones and restricted polygons.</p>
+        </div>
+      </header>
+
+      <div class="card">
+        <div class="toolbar">
+          <label>Camera
+            <select id="rule-cam"></select>
+          </label>
+          <div class="seg" id="draw-tools">
+            <button class="seg-btn active" data-mode="none">Select</button>
+            <button class="seg-btn" data-mode="line">／ Line</button>
+            <button class="seg-btn" data-mode="circle">◯ Circle</button>
+            <button class="seg-btn" data-mode="polygon">⬡ Polygon</button>
+          </div>
+          <input id="zone-name" placeholder="Zone name" />
+          <button class="btn primary" id="save-zone">Save Zone</button>
+          <button class="btn ghost" id="clear-draw">Clear</button>
+        </div>
+
+        <div id="stage" class="stage">
+          <img id="feed" alt="" />
+          <canvas id="overlay"></canvas>
+          <div id="stage-empty" class="stage-empty">Select a running camera</div>
+        </div>
+        <p class="hint" id="draw-hint">Pick a draw tool to begin.</p>
+      </div>
+
+      <div class="card">
+        <h3>Zones on this camera</h3>
+        <div id="zone-list" class="zone-list"></div>
+      </div>
+    </section>
+
+    <!-- ──────── VIEW: ALERTS ──────── -->
+    <section id="view-alerts" class="view">
+      <header class="view-head">
+        <div>
+          <h1>Intrusion Alerts</h1>
+          <p>Captured evidence — auto-deleted after 2 hours.</p>
+        </div>
+        <button class="btn ghost" id="alerts-refresh">⟳ Refresh</button>
+      </header>
+      <div id="alerts-grid" class="alerts-grid"></div>
+      <div id="alerts-empty" class="empty">No intrusion alerts yet.</div>
+    </section>
+
+  </main>
+</div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,417 @@
+/* ═══════════════════════════════════════════════════════════════
+   AI Intrusion & Virtual Tripwire System — dashboard logic
+   ═══════════════════════════════════════════════════════════════ */
+"use strict";
+
+const $  = (id) => document.getElementById(id);
+const $$ = (sel) => Array.from(document.querySelectorAll(sel));
+
+async function api(url, opts) {
+  const r = await fetch(url, opts);
+  let data = {};
+  try { data = await r.json(); } catch (_) {}
+  if (!r.ok) throw new Error(data.error || r.statusText);
+  return data;
+}
+
+/* shared state */
+let cameras = [];          // [{id,name,status,running,...}]
+let pipelines = {};        // id -> {status,fps,...}
+let currentView = "live";
+
+/* ───────────────── NAVIGATION ───────────────── */
+$$(".nav-item").forEach((btn) =>
+  btn.addEventListener("click", () => showView(btn.dataset.view))
+);
+
+function showView(view) {
+  currentView = view;
+  $$(".nav-item").forEach((b) =>
+    b.classList.toggle("active", b.dataset.view === view)
+  );
+  $$(".view").forEach((v) =>
+    v.classList.toggle("active", v.id === "view-" + view)
+  );
+  if (view === "live")    renderLive();
+  if (view === "cameras") renderCameras();
+  if (view === "rules")   renderRules();
+  if (view === "alerts")  loadAlerts();
+}
+
+/* ───────────────── SYSTEM / DEVICE ───────────────── */
+async function refreshSystem() {
+  try {
+    const s = await api("/api/system");
+    const d = s.device;
+    $("device-name").textContent = `${d.name}`;
+    $("device-dot").className = "dot " + d.kind;
+    pipelines = {};
+    (s.pipelines || []).forEach((p) => (pipelines[p.camera_id] = p));
+  } catch (_) {
+    $("device-name").textContent = "unavailable";
+  }
+}
+
+async function refreshCameras() {
+  try { cameras = await api("/api/cameras"); }
+  catch (_) { cameras = []; }
+}
+
+/* ───────────────── LIVE STREAMING ───────────────── */
+async function renderLive() {
+  await refreshSystem();
+  await refreshCameras();
+  const grid = $("live-grid");
+  const running = cameras.filter((c) => c.running);
+
+  $("live-empty").classList.toggle("show", running.length === 0);
+
+  // Only rebuild cards when the set of cameras changes (keeps streams alive).
+  const ids = running.map((c) => c.id).join(",");
+  if (grid.dataset.ids !== ids) {
+    grid.dataset.ids = ids;
+    grid.innerHTML = running
+      .map(
+        (c) => `
+      <div class="cam-card" data-id="${c.id}">
+        <div class="feed-wrap">
+          <span class="live-tag">● LIVE</span>
+          <span class="fps-tag" id="fps-${c.id}">-- fps</span>
+          <img src="/api/cameras/${c.id}/stream?t=${Date.now()}" alt="${c.name}" />
+        </div>
+        <div class="cam-bar">
+          <b>${c.name}</b>
+          <span class="status-online" id="st-${c.id}">online</span>
+        </div>
+      </div>`
+      )
+      .join("");
+  }
+  // Live-update fps / status without touching the <img>.
+  running.forEach((c) => {
+    const p = pipelines[c.id] || {};
+    const fps = $("fps-" + c.id);
+    const st = $("st-" + c.id);
+    if (fps) fps.textContent = (p.fps ?? 0).toFixed(1) + " fps";
+    if (st) {
+      st.textContent = p.status || "online";
+      st.className = "status-" + (p.status || "online");
+    }
+  });
+}
+
+$("live-refresh").addEventListener("click", () => {
+  $("live-grid").dataset.ids = "";          // force rebuild
+  renderLive();
+});
+
+/* ───────────────── ADD CAMERAS ───────────────── */
+async function renderCameras() {
+  await refreshSystem();
+  await refreshCameras();
+  $("camera-rows").innerHTML = cameras
+    .map((c) => {
+      const p = pipelines[c.id] || {};
+      const status = p.status || c.status || "offline";
+      return `<tr>
+        <td>${c.id}</td>
+        <td>${c.name}</td>
+        <td class="status-${status}">${status}</td>
+        <td>${p.fps != null ? p.fps.toFixed(1) : "—"}</td>
+        <td>
+          <button class="btn ghost sm" data-act="test"  data-id="${c.id}">Test</button>
+          ${c.running
+            ? `<button class="btn ghost sm" data-act="stop" data-id="${c.id}">Stop</button>`
+            : `<button class="btn primary sm" data-act="start" data-id="${c.id}">Start</button>`}
+          <button class="btn danger sm" data-act="del" data-id="${c.id}">Delete</button>
+        </td>
+      </tr>`;
+    })
+    .join("") ||
+    `<tr><td colspan="5" style="color:var(--muted)">No cameras configured.</td></tr>`;
+}
+
+$("camera-rows").addEventListener("click", async (e) => {
+  const btn = e.target.closest("button");
+  if (!btn) return;
+  const id = btn.dataset.id;
+  btn.disabled = true;
+  try {
+    if (btn.dataset.act === "test") {
+      const r = await api(`/api/cameras/${id}/test`, { method: "POST" });
+      alert(r.ok ? "✅ Connection OK" : "❌ Connection failed");
+    } else if (btn.dataset.act === "start") {
+      await api(`/api/cameras/${id}/start`, { method: "POST" });
+    } else if (btn.dataset.act === "stop") {
+      await api(`/api/cameras/${id}/stop`, { method: "POST" });
+    } else if (btn.dataset.act === "del") {
+      if (!confirm("Delete this camera and its zones?")) { btn.disabled = false; return; }
+      await api(`/api/cameras/${id}`, { method: "DELETE" });
+    }
+    renderCameras();
+  } catch (err) {
+    alert("Error: " + err.message);
+    btn.disabled = false;
+  }
+});
+
+$("camera-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const fd = new FormData(e.target);
+  try {
+    await api("/api/cameras", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        name: fd.get("name"),
+        url: fd.get("url"),
+        port: fd.get("port") || null,
+        username: fd.get("username") || null,
+        password: fd.get("password") || null,
+        latitude: parseFloat(fd.get("latitude")) || null,
+        longitude: parseFloat(fd.get("longitude")) || null,
+        enabled: true,
+      }),
+    });
+    e.target.reset();
+    renderCameras();
+  } catch (err) {
+    alert("Error: " + err.message);
+  }
+});
+
+/* ───────────────── LINES & RULES ───────────────── */
+let drawMode = "none";
+let drawPoints = [];           // canvas display-space points
+let polyClosed = false;
+
+const feed = $("feed");
+const overlay = $("overlay");
+
+async function renderRules() {
+  await refreshCameras();
+  const sel = $("rule-cam");
+  const running = cameras.filter((c) => c.running);
+  const prev = sel.value;
+  sel.innerHTML = running
+    .map((c) => `<option value="${c.id}">#${c.id} ${c.name}</option>`)
+    .join("");
+  if (running.length) {
+    const keep = running.some((c) => String(c.id) === prev);
+    sel.value = keep ? prev : String(running[0].id);
+    loadStream(sel.value);
+  } else {
+    feed.removeAttribute("src");
+    $("stage-empty").style.display = "flex";
+    $("zone-list").innerHTML =
+      `<div class="zone-row" style="color:var(--muted)">Start a camera first.</div>`;
+  }
+}
+
+$("rule-cam").addEventListener("change", (e) => loadStream(e.target.value));
+
+function loadStream(camId) {
+  if (!camId) return;
+  $("stage-empty").style.display = "none";
+  feed.src = `/api/cameras/${camId}/stream?t=${Date.now()}`;
+  resetDraw();
+  loadZones();
+}
+
+/* draw tool selector */
+$("draw-tools").addEventListener("click", (e) => {
+  const b = e.target.closest(".seg-btn");
+  if (!b) return;
+  $$("#draw-tools .seg-btn").forEach((x) => x.classList.remove("active"));
+  b.classList.add("active");
+  drawMode = b.dataset.mode;
+  resetDraw();
+  const hints = {
+    none: "Select mode — pick a tool to draw.",
+    line: "Line: click 2 points to set the tripwire.",
+    circle: "Circle: click the centre, then a point on the edge.",
+    polygon: "Polygon: click each corner, double-click to finish.",
+  };
+  $("draw-hint").textContent = hints[drawMode];
+});
+
+$("clear-draw").addEventListener("click", resetDraw);
+
+function resetDraw() {
+  drawPoints = [];
+  polyClosed = false;
+  redraw();
+}
+
+/* keep canvas pixel size synced to the displayed image */
+function syncCanvas() {
+  overlay.width = feed.clientWidth;
+  overlay.height = feed.clientHeight;
+  redraw();
+}
+window.addEventListener("resize", syncCanvas);
+feed.addEventListener("load", syncCanvas);
+
+/* map a canvas display point to native image pixels */
+function toNative(pt) {
+  const sx = (feed.naturalWidth || feed.clientWidth) / feed.clientWidth;
+  const sy = (feed.naturalHeight || feed.clientHeight) / feed.clientHeight;
+  return [Math.round(pt[0] * sx), Math.round(pt[1] * sy)];
+}
+
+overlay.addEventListener("click", (e) => {
+  if (drawMode === "none") return;
+  const r = overlay.getBoundingClientRect();
+  const pt = [e.clientX - r.left, e.clientY - r.top];
+  if (drawMode === "line" || drawMode === "circle") {
+    if (drawPoints.length >= 2) drawPoints = [];
+    drawPoints.push(pt);
+  } else if (drawMode === "polygon") {
+    if (polyClosed) { drawPoints = []; polyClosed = false; }
+    drawPoints.push(pt);
+  }
+  redraw();
+});
+
+overlay.addEventListener("dblclick", () => {
+  if (drawMode === "polygon" && drawPoints.length >= 3) {
+    polyClosed = true;
+    redraw();
+  }
+});
+
+function redraw() {
+  const ctx = overlay.getContext("2d");
+  ctx.clearRect(0, 0, overlay.width, overlay.height);
+  ctx.lineWidth = 2.5;
+  ctx.strokeStyle = "#2dd4bf";
+  ctx.fillStyle = "#2dd4bf";
+
+  drawPoints.forEach((p) => {
+    ctx.beginPath();
+    ctx.arc(p[0], p[1], 5, 0, Math.PI * 2);
+    ctx.fill();
+  });
+
+  if (drawMode === "line" && drawPoints.length === 2) {
+    line(ctx, drawPoints[0], drawPoints[1]);
+  } else if (drawMode === "circle" && drawPoints.length === 2) {
+    const rad = dist(drawPoints[0], drawPoints[1]);
+    ctx.beginPath();
+    ctx.arc(drawPoints[0][0], drawPoints[0][1], rad, 0, Math.PI * 2);
+    ctx.stroke();
+  } else if (drawMode === "polygon" && drawPoints.length >= 2) {
+    ctx.beginPath();
+    ctx.moveTo(...drawPoints[0]);
+    drawPoints.slice(1).forEach((p) => ctx.lineTo(...p));
+    if (polyClosed) ctx.closePath();
+    ctx.stroke();
+  }
+}
+const dist = (a, b) => Math.hypot(b[0] - a[0], b[1] - a[1]);
+function line(ctx, a, b) {
+  ctx.beginPath(); ctx.moveTo(...a); ctx.lineTo(...b); ctx.stroke();
+}
+
+$("save-zone").addEventListener("click", async () => {
+  const camId = $("rule-cam").value;
+  if (!camId) return alert("Select a running camera first.");
+  let coords = null;
+
+  if (drawMode === "line" && drawPoints.length === 2) {
+    const [a, b] = drawPoints.map(toNative);
+    coords = { x1: a[0], y1: a[1], x2: b[0], y2: b[1] };
+  } else if (drawMode === "circle" && drawPoints.length === 2) {
+    const c = toNative(drawPoints[0]);
+    const e = toNative(drawPoints[1]);
+    coords = { cx: c[0], cy: c[1], radius: Math.round(dist(c, e)) };
+  } else if (drawMode === "polygon" && drawPoints.length >= 3) {
+    coords = { points: drawPoints.map(toNative) };
+  } else {
+    return alert("Finish drawing the zone first.");
+  }
+
+  try {
+    await api(`/api/cameras/${camId}/zones`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        zone_type: drawMode,
+        name: $("zone-name").value || drawMode + " zone",
+        coordinates: coords,
+      }),
+    });
+    $("zone-name").value = "";
+    resetDraw();
+    loadZones();
+  } catch (err) {
+    alert("Error: " + err.message);
+  }
+});
+
+async function loadZones() {
+  const camId = $("rule-cam").value;
+  if (!camId) return;
+  const zones = await api(`/api/cameras/${camId}/zones`);
+  $("zone-list").innerHTML = zones.length
+    ? zones
+        .map(
+          (z) => `<div class="zone-row">
+            <span>
+              <span class="zone-badge zb-${z.zone_type}">${z.zone_type}</span>
+              ${z.name}
+            </span>
+            <button class="btn danger sm" data-zone="${z.id}">Remove</button>
+          </div>`
+        )
+        .join("")
+    : `<div class="zone-row" style="color:var(--muted)">No zones yet.</div>`;
+}
+
+$("zone-list").addEventListener("click", async (e) => {
+  const btn = e.target.closest("button[data-zone]");
+  if (!btn) return;
+  await api(`/api/zones/${btn.dataset.zone}`, { method: "DELETE" });
+  loadZones();
+});
+
+/* ───────────────── ALERTS ───────────────── */
+async function loadAlerts() {
+  let alerts = [];
+  try { alerts = await api("/api/alerts?limit=40"); } catch (_) {}
+  $("alert-count").textContent = alerts.length;
+  $("alerts-empty").classList.toggle("show", alerts.length === 0);
+  $("alerts-grid").innerHTML = alerts
+    .map((a) => {
+      const file = a.image_path
+        ? a.image_path.replace(/\\/g, "/").split("/").pop()
+        : null;
+      return `<div class="alert-card">
+        ${file ? `<img src="/snapshots/${file}" alt="evidence" />` : ""}
+        <div class="a-meta">
+          <span class="a-type">${a.alert_type}</span><br/>
+          <b>${a.label} #${a.track_id}</b><br/>
+          <small>Camera ${a.camera_id} · ${new Date(a.timestamp).toLocaleString()}</small>
+        </div>
+      </div>`;
+    })
+    .join("");
+}
+$("alerts-refresh").addEventListener("click", loadAlerts);
+
+/* ───────────────── BOOT / POLLING ───────────────── */
+async function tick() {
+  await refreshSystem();
+  if (currentView === "live")    renderLive();
+  if (currentView === "cameras") renderCameras();
+  if (currentView === "alerts" || currentView === "live") {
+    try {
+      const a = await api("/api/alerts?limit=40");
+      $("alert-count").textContent = a.length;
+    } catch (_) {}
+  }
+}
+
+refreshSystem().then(() => showView("live"));
+loadAlerts();
+setInterval(tick, 5000);

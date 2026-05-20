@@ -1,0 +1,36 @@
+# ── AI Intrusion & Virtual Tripwire System ───────────────────────────
+# Core
+ultralytics>=8.3.0          # YOLOv11 detection + ByteTrack tracking
+opencv-python>=4.9.0        # RTSP capture + video processing
+numpy>=1.26.0
+
+# Backend / API
+fastapi>=0.110.0
+uvicorn[standard]>=0.29.0
+python-multipart>=0.0.9
+jinja2>=3.1.0
+pyyaml>=6.0
+
+# Database
+SQLAlchemy>=2.0.0
+# psycopg2-binary>=2.9.0    # uncomment only if you use PostgreSQL
+
+# Scheduling (image cleanup engine)
+APScheduler>=3.10.0
+
+# Alerts
+requests>=2.31.0
+
+# Security — camera password encryption (Fernet/AES)
+cryptography>=42.0.0
+
+# ── Device-specific acceleration (install ONE of the following) ──────
+# GPU (NVIDIA / CUDA):
+#   pip install torch --index-url https://download.pytorch.org/whl/cu121
+# CPU only (smaller, faster install):
+#   pip install torch --index-url https://download.pytorch.org/whl/cpu
+torch>=2.2.0
+
+# Optional CPU accelerators (auto-used if present):
+onnxruntime>=1.17.0         # ONNX Runtime CPU backend
+# openvino>=2024.0.0        # Intel OpenVINO backend (best on Intel CPUs)

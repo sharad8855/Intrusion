@@ -1,0 +1,82 @@
+# ─────────────────────────────────────────────────────────────────────
+# AI Intrusion & Virtual Tripwire System — main configuration
+# ─────────────────────────────────────────────────────────────────────
+
+system:
+  host: "0.0.0.0"
+  port: 8000
+  database_url: "sqlite:///./intrusion.db"   # or postgresql://user:pass@host/db
+  snapshot_dir: "./snapshots"
+  recording_dir: "./recordings"
+  model_dir: "./models"
+
+# ── Security ─────────────────────────────────────────────────────────
+# Camera passwords are encrypted (AES/Fernet) before being stored in the
+# database. Leave fernet_key empty to disable encryption (stored as-is).
+# Generate a key:
+#   python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+security:
+  fernet_key: ""
+
+# ── Device / acceleration ────────────────────────────────────────────
+# device:  auto | cpu | cuda | cuda:0
+#   auto -> use NVIDIA GPU if available, otherwise CPU.
+device:
+  mode: "auto"
+  half_precision: "auto"      # auto | true | false  (FP16 on GPU only)
+  cudnn_benchmark: true       # speeds up GPU when input size is fixed
+  cpu_threads: 0              # 0 = auto (use physical core count)
+
+# ── Detection model ──────────────────────────────────────────────────
+detection:
+  weights: "yolo11n.pt"       # n=nano (fastest) ... x=largest. CPU -> n/s.
+  confidence: 0.35
+  iou: 0.5
+  # Inference image size. Auto-tuned per device if left as "auto".
+  imgsz: "auto"               # auto | 320 | 416 | 640 ...
+  classes:                    # COCO ids to keep
+    person: 0
+    bicycle: 1
+    car: 2
+    motorcycle: 3
+    truck: 7
+
+# ── Model optimization (one-time export for faster inference) ────────
+optimization:
+  auto_export: true           # export an accelerated model on first run
+  gpu_format: "engine"        # engine (TensorRT) | onnx | none
+  cpu_format: "openvino"      # openvino | onnx | none
+
+# ── Tracking ─────────────────────────────────────────────────────────
+tracking:
+  tracker: "bytetrack.yaml"   # ByteTrack config bundled with ultralytics
+
+# ── Pipeline / performance ───────────────────────────────────────────
+pipeline:
+  target_fps: 30              # processing FPS cap per camera
+  frame_skip: "auto"          # auto | 0 | 1 | 2 ... (drop frames if slow)
+  rtsp_transport: "tcp"       # tcp (reliable) | udp (low latency)
+  rtsp_timeout: 8             # seconds — connection/read timeout (no hangs)
+  reconnect_delay: 5          # seconds before retrying a dropped stream
+
+# ── Alerts ───────────────────────────────────────────────────────────
+alerts:
+  cooldown_seconds: 15        # min gap between alerts for the same track
+  whatsapp:
+    provider: "twilio"        # twilio | meta | webhook | disabled
+    # --- Twilio ---
+    twilio_sid: ""
+    twilio_token: ""
+    twilio_from: "whatsapp:+14155238886"
+    twilio_to: "whatsapp:+910000000000"
+    # --- Meta Cloud API ---
+    meta_token: ""
+    meta_phone_id: ""
+    meta_to: ""
+    # --- Generic webhook ---
+    webhook_url: ""
+
+# ── Evidence cleanup ─────────────────────────────────────────────────
+cleanup:
+  retention_hours: 2
+  scan_interval_minutes: 10
