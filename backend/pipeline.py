@@ -37,7 +37,7 @@ import re
 import socket
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -46,6 +46,7 @@ import cv2
 from backend.alerts.whatsapp import NOTIFIER
 from backend.core.config import CONFIG
 from backend.core.device import DEVICE
+from backend.core.redis_client import DEDUP
 from backend.database.db import session_scope
 from backend.database.models import Alert, Camera
 from backend.detector.detector import Detector
@@ -55,6 +56,8 @@ from backend.rules.rule_engine import RuleEngine
 _RTSP_TIMEOUT_S  = float(CONFIG.get_path("pipeline.rtsp_timeout", 8))
 _RTSP_TIMEOUT_MS = int(_RTSP_TIMEOUT_S * 1000)
 _RECONNECT_DELAY = float(CONFIG.get_path("pipeline.reconnect_delay", 5))
+_WARMUP_FRAMES   = int(CONFIG.get_path("pipeline.warmup_frames", 30))
+_MAX_GRAB_FAILS  = int(CONFIG.get_path("pipeline.max_grab_fails", 120))
 
 # Common RTSP sub-paths to probe when only a bare host URL is provided.
 # Covers Dahua, Hikvision, CP-Plus, Reolink, ONVIF and private-protocol
@@ -71,6 +74,11 @@ _RTSP_PATHS = [
     "/live.sdp",
     "/",
 ]
+
+# Common RTSP TCP ports. Many CCTV cameras / NVRs expose RTSP on a
+# non-standard port (8554 is very common). When the configured port does
+# not answer, these are scanned so a changed/mistyped port still connects.
+_RTSP_PORTS = [554, 8554, 88, 10554]
 
 
 def _mask_url(url: str) -> str:
@@ -89,66 +97,127 @@ def _ping_host(host: str, port: int, timeout: float = 3.0) -> bool:
 
 def _ffmpeg_open(url: str, transport: str) -> cv2.VideoCapture:
     """
-    Open an RTSP URL with FFmpeg backend using proper options
-    (from cctv-management _open_capture):
+    Open an RTSP URL with the FFmpeg backend.
 
+    The backend is ALWAYS pinned to ``cv2.CAP_FFMPEG`` — never CAP_ANY — so
+    OpenCV cannot fall back to the CV_IMAGES backend, which mistakes an
+    ``rtsp://`` URL for an image-sequence pattern and logs the noisy
+    ``CAP_IMAGES: error, expected '0?[1-9][du]' pattern`` warning.
+
+    Two independent timeout mechanisms guarantee a dead/slow camera can
+    never hang the reader thread:
+
+      * OpenCV-native CAP_PROP_OPEN/READ_TIMEOUT_MSEC — passed as
+        construction params; works regardless of the bundled FFmpeg version.
+      * FFmpeg ``timeout`` / ``stimeout`` socket options. ``stimeout`` was
+        removed in modern FFmpeg builds (the one shipped with opencv-python
+        4.13 uses ``timeout``); both keys are supplied and FFmpeg silently
+        ignores whichever one it does not recognise.
+
+    Other options (from cctv-management `_open_capture`):
       rtsp_transport  — tcp or udp
       probesize       — 32 MB so SPS/PPS/IDR headers are found in H.265
       analyzeduration — 10 s for reliable codec detection
       fflags          — nobuffer (no internal FFmpeg buffer)
       flags           — low_delay
-      stimeout        — socket timeout in µs
     """
+    timeout_us = int(_RTSP_TIMEOUT_S * 1_000_000)
     opts = [
-        f"rtsp_transport|{transport}",
-        "probesize|32000000",
-        "analyzeduration|10000000",
-        "fflags|nobuffer",
-        "flags|low_delay",
-        f"stimeout|{int(_RTSP_TIMEOUT_S * 1_000_000)}",
+        "rtsp_transport", transport,
+        "probesize", "32000000",
+        "analyzeduration", "10000000",
+        "fflags", "nobuffer",
+        "flags", "low_delay",
+        "timeout", str(timeout_us),     # modern FFmpeg socket timeout (µs)
+        "stimeout", str(timeout_us),    # legacy FFmpeg alias (older builds)
     ]
     os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "|".join(opts)
 
-    cap = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
+    # OpenCV-native timeouts — version-independent, applied at construction.
+    params: list[int] = []
+    for prop in ("CAP_PROP_OPEN_TIMEOUT_MSEC", "CAP_PROP_READ_TIMEOUT_MSEC"):
+        if hasattr(cv2, prop):
+            params += [getattr(cv2, prop), _RTSP_TIMEOUT_MS]
+
+    try:
+        cap = (cv2.VideoCapture(url, cv2.CAP_FFMPEG, params)
+               if params else cv2.VideoCapture(url, cv2.CAP_FFMPEG))
+    except Exception:
+        cap = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
+
     if cap.isOpened():
-        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)   # keep only the latest frame
+        try:
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)   # keep only the latest frame
+        except Exception:
+            pass
     return cap
+
+
+def _reachable_ports(host: str, ports: list[int]) -> list[int]:
+    """Return the subset of ``ports`` that currently accept a TCP connection."""
+    return [p for p in ports if _ping_host(host, p, timeout=2.5)]
+
+
+def _build_rtsp(scheme: str, username: str, password: str,
+                host: str, port: int, path: str) -> str:
+    """Reassemble an RTSP URL from parts (credentials kept verbatim)."""
+    auth = f"{username}:{password}@" if username else ""
+    return f"{scheme}://{auth}{host}:{port}{path}"
 
 
 def _open_rtsp(base_url: str, transport: str) -> tuple[cv2.VideoCapture | None, str]:
     """
-    Mirrors cctv-management `_open_capture_rtsp`:
+    Open an RTSP camera, probing path / port / scheme variants.
 
-    1. If the URL already has a non-root path, try it directly.
-    2. Otherwise probe every path in _RTSP_PATHS across both
-       rtsp:// and rtsps:// schemes.
+    Strategy (extends cctv-management `_open_capture_rtsp`):
+
+      1. If the URL already has a specific path, try it verbatim first.
+      2. Otherwise — or if step 1 fails — scan which candidate TCP ports
+         actually answer, then probe every (scheme, port, path) combination
+         on those reachable ports only, so the search stays fast.
 
     Returns (cap, working_url) or (None, "").
     """
-    parsed = urlparse(base_url if "://" in base_url else f"rtsp://{base_url}")
+    parsed   = urlparse(base_url if "://" in base_url else f"rtsp://{base_url}")
+    host     = parsed.hostname or base_url.split("/")[0].split(":")[0]
+    username = parsed.username or ""
+    password = parsed.password or ""          # kept percent-encoded, as given
+    cfg_port = parsed.port or 554
+    path     = parsed.path or ""
+    if parsed.query:
+        path = f"{path}?{parsed.query}"
 
-    # URL already has a specific path — try it directly.
-    if parsed.path and parsed.path not in ("", "/"):
+    caller_scheme = parsed.scheme if parsed.scheme in ("rtsp", "rtsps") else "rtsp"
+    other_scheme  = "rtsps" if caller_scheme == "rtsp" else "rtsp"
+
+    # 1) Explicit path — try exactly what the user configured first.
+    if path and path not in ("", "/"):
         cap = _ffmpeg_open(base_url, transport)
         if cap.isOpened():
             return cap, base_url
         cap.release()
+        paths = [path]                        # keep the user's path; vary port
+    else:
+        paths = _RTSP_PATHS
+
+    # 2) Scan reachable ports (configured port first) and probe combinations.
+    candidate_ports = [cfg_port] + [p for p in _RTSP_PORTS if p != cfg_port]
+    ports = _reachable_ports(host, candidate_ports)
+    if not ports:
+        print(f"[reader] no RTSP port open on {host} (tried {candidate_ports}) "
+              f"— check the camera IP / that it is powered on / same network")
         return None, ""
 
-    # Strip scheme for rebuilding; honour caller's scheme first.
-    scheme_stripped  = base_url.split("://", 1)[1] if "://" in base_url else base_url
-    scheme_stripped  = scheme_stripped.rstrip("/")
-    caller_scheme    = parsed.scheme if parsed.scheme in ("rtsp", "rtsps") else "rtsp"
-    other_scheme     = "rtsps" if caller_scheme == "rtsp" else "rtsp"
-
     for scheme in (caller_scheme, other_scheme):
-        for path in _RTSP_PATHS:
-            full_url = f"{scheme}://{scheme_stripped}{path}"
-            print(f"[reader] trying {_mask_url(full_url)} [{transport}]")
-            cap = _ffmpeg_open(full_url, transport)
-            if cap.isOpened():
-                return cap, full_url
-            cap.release()
+        for port in ports:
+            for sub_path in paths:
+                full_url = _build_rtsp(scheme, username, password,
+                                       host, port, sub_path)
+                print(f"[reader] trying {_mask_url(full_url)} [{transport}]")
+                cap = _ffmpeg_open(full_url, transport)
+                if cap.isOpened():
+                    return cap, full_url
+                cap.release()
 
     return None, ""
 
@@ -194,17 +263,9 @@ class FrameReader(threading.Thread):
                 pass
             return (cap, self.source) if cap.isOpened() else (None, "")
 
-        # Network stream — ping first to avoid long FFmpeg hang.
-        url_for_parse = self.source if "://" in self.source else f"rtsp://{self.source}"
-        parsed = urlparse(url_for_parse)
-        host   = parsed.hostname or self.source.split("/")[0].split(":")[0]
-        port   = parsed.port or 554
-
-        if not _ping_host(host, port, timeout=3.0):
-            print(f"[reader] host {host}:{port} unreachable")
-            return None, ""
-
-        # Try current transport; toggle and retry once on failure.
+        # Network stream. Port reachability (including the fallback ports)
+        # is handled inside _open_rtsp; here we only try the current
+        # transport, then toggle TCP<->UDP and retry once on failure.
         cap, url = _open_rtsp(self.source, self._transport)
         if cap is None:
             alt = self._toggle_transport()
@@ -214,36 +275,65 @@ class FrameReader(threading.Thread):
         return (cap, url) if cap else (None, "")
 
     def run(self):
-        announced = False
+        is_network = not (isinstance(self.source, str) and self.source.isdigit())
         while self._running:
             cap, working_url = self._open()
             self._cap = cap
 
             if not cap or not cap.isOpened():
-                self.connected    = False
-                self.conn_status  = "error"
+                self.connected   = False
+                self.conn_status = "error"
                 print(f"[reader] cannot connect to {_mask_url(self.source)} "
                       f"— retrying in {_RECONNECT_DELAY:.0f}s")
                 time.sleep(_RECONNECT_DELAY)
                 continue
 
-            self.connected    = True
-            self.conn_status  = "online"
-            if not announced:
-                print(f"[reader] connected: {_mask_url(working_url)}")
-                announced = True
+            self.connected   = True
+            self.conn_status = "online"
+            print(f"[reader] connected: {_mask_url(working_url)}")
 
+            # Warm up the decoder — H.264/H.265 CCTV encoders emit a few
+            # junk frames before the first valid IDR. Discarding them avoids
+            # green/garbled startup frames (cctv-management capture loop).
+            if is_network:
+                for _ in range(_WARMUP_FRAMES):
+                    if not self._running or not cap.grab():
+                        break
+
+            fails = 0
             while self._running:
-                ok, frame = cap.read()
-                if not ok:
-                    break
+                if is_network:
+                    # Drain the RTSP buffer so the pipeline always processes
+                    # the NEWEST frame instead of accumulating latency.
+                    if not cap.grab():
+                        fails += 1
+                        if fails > _MAX_GRAB_FAILS:
+                            break
+                        time.sleep(0.02)
+                        continue
+                    for _ in range(4):              # discard buffered backlog
+                        if not cap.grab():
+                            break
+                    ok, frame = cap.retrieve()
+                else:
+                    ok, frame = cap.read()
+
+                if not ok or frame is None:
+                    fails += 1
+                    if fails > _MAX_GRAB_FAILS:
+                        break
+                    time.sleep(0.02)
+                    continue
+
+                fails = 0
                 with self._lock:
                     self._frame = frame
 
-            self.connected    = False
-            self.conn_status  = "error"
-            announced         = False
+            self.connected   = False
+            self.conn_status = "error"
             cap.release()
+            print(f"[reader] stream lost on {_mask_url(self.source)} "
+                  f"— reconnecting in {_RECONNECT_DELAY:.0f}s")
             time.sleep(_RECONNECT_DELAY)
 
     def read(self):
@@ -294,11 +384,15 @@ class CameraPipeline(threading.Thread):
 
         # Track last DB status to avoid redundant writes.
         self._last_db_status = ""
+        
+        # Spatial-temporal alert memory for duplicate/flickering track suppression
+        self._recent_alerts_memory: list[dict] = []
 
     # ── public ───────────────────────────────────────────────────────
     def update_zones(self, zones):
         self._zones = zones
         self.rules.set_zones(zones)
+        DEDUP.clear_spatial_history(self.camera_id)
 
     def get_jpeg(self):
         with self._jpeg_lock:
@@ -390,7 +484,7 @@ class CameraPipeline(threading.Thread):
             self._publish(annotated)
 
             for ev in events:
-                self._handle_event(ev, annotated)
+                self._handle_event(ev, frame, annotated)
 
             if self._auto_skip and ema_infer:
                 self._frame_skip = max(0, int(ema_infer / frame_interval))
@@ -442,11 +536,121 @@ class CameraPipeline(threading.Thread):
             with self._jpeg_lock:
                 self._jpeg = buf.tobytes()
 
-    def _handle_event(self, ev, annotated):
+    @staticmethod
+    def _crop_person(frame, bbox):
+        """
+        Return a crop of the intruding object with generous upward and horizontal padding
+        to guarantee the head and face are captured fully and clearly.
+        """
+        try:
+            x1, y1, x2, y2 = (int(v) for v in bbox)
+            h, w = frame.shape[:2]
+            
+            bw = x2 - x1
+            bh = y2 - y1
+            
+            # Substantial upward padding to capture the head/face (usually 45% of bbox height)
+            pad_up = int(bh * 0.45) + 20
+            # Moderate downward padding to get feet/context
+            pad_down = int(bh * 0.15) + 15
+            # Generous horizontal padding to prevent cutting off shoulders or side profile
+            pad_left = int(bw * 0.25) + 15
+            pad_right = int(bw * 0.25) + 15
+            
+            # Apply padding and clamp to image boundaries
+            x1 = max(0, x1 - pad_left)
+            y1 = max(0, y1 - pad_up)
+            x2 = min(w, x2 + pad_right)
+            y2 = min(h, y2 + pad_down)
+            
+            if x2 <= x1 or y2 <= y1:
+                return None
+            crop = frame[y1:y2, x1:x2].copy()
+            return crop if crop.size else None
+        except Exception:
+            return None
+
+    @staticmethod
+    def _recent_alert_exists(camera_id: int, zone_id: int, track_id: int, ttl: float) -> bool:
+        """
+        True if an alert was already saved for this specific track in this (camera, zone)
+        within ``ttl`` seconds. This reads the Alert table, so the de-duplication
+        survives process restarts.
+        """
+        cutoff = datetime.now() - timedelta(seconds=ttl)
+        try:
+            with session_scope() as s:
+                return s.query(Alert.id).filter(
+                    Alert.camera_id == camera_id,
+                    Alert.zone_id == zone_id,
+                    Alert.track_id == track_id,
+                    Alert.timestamp >= cutoff,
+                ).first() is not None
+        except Exception:
+            return False
+
+    @staticmethod
+    def _any_recent_alert_in_zone(camera_id: int, zone_id: int, seconds: float) -> bool:
+        """
+        True if any alert was triggered in this (camera, zone) within ``seconds``,
+        regardless of the track ID. Prevents rapid-fire alerts due to track flickering.
+        """
+        if seconds <= 0:
+            return False
+        cutoff = datetime.now() - timedelta(seconds=seconds)
+        try:
+            with session_scope() as s:
+                return s.query(Alert.id).filter(
+                    Alert.camera_id == camera_id,
+                    Alert.zone_id == zone_id,
+                    Alert.timestamp >= cutoff,
+                ).first() is not None
+        except Exception:
+            return False
+
+    def _handle_event(self, ev, frame, annotated):
+        # ── De-duplicate: don't keep sending the same person ─────────
+        # Keyed on (camera, zone, track_id) to avoid photographing and notifying
+        # about the same tracked individual repeatedly, while keeping instant
+        # detection and capture active for any new intruders.
+        #
+        # Two guards are used together:
+        #   1. Redis (fast, atomic, shared) — when it is connected.
+        #   2. The Alert table — the persistent source of truth.
+        # An alert is sent only when BOTH guards agree it is new.
+        dedup_ttl = float(CONFIG.get_path("redis.alert_dedup_seconds", 300))
+        dedup_key = f"intrusion:alert:{ev.camera_id}:{ev.zone_id}:{ev.track_id}"
+        fresh_in_redis = DEDUP.should_send(dedup_key, dedup_ttl)
+        if not fresh_in_redis or self._recent_alert_exists(
+                ev.camera_id, ev.zone_id, ev.track_id, dedup_ttl):
+            return                       # this tracked individual already triggered recently
+
+        # ── Camera-Wide Spatial-Temporal Cooldown Guard (Redis-backed) ──
+        # To filter track ID flickering/jitter and crossing of overlapping zones,
+        # we suppress alerts if a detection occurs at virtually the exact same spatial
+        # spot on the same camera within the `dedup_ttl` window.
+        h, w = frame.shape[:2]
+        spatial_threshold_ratio = float(CONFIG.get_path("alerts.spatial_threshold_ratio", 0.15))
+        
+        is_spatial_dup = DEDUP.is_spatial_duplicate(
+            camera_id=ev.camera_id,
+            cx=float(ev.centroid[0]),
+            cy=float(ev.centroid[1]),
+            width=w,
+            spatial_threshold_ratio=spatial_threshold_ratio,
+            ttl=dedup_ttl,
+            track_id=ev.track_id
+        )
+        if is_spatial_dup:
+            return  # Suppress duplicate/flickering track at the same spot on this camera
+
         ts    = datetime.now()
         fname = f"cam{ev.camera_id}_{ev.zone_type}_{ts:%Y%m%d_%H%M%S}_{ev.track_id}.jpg"
         path  = self.snapshot_dir / fname
-        cv2.imwrite(str(path), annotated)
+
+        # ── Save ONLY the intruding person — not the whole screen ───────
+        crop = self._crop_person(frame, ev.bbox)
+        cv2.imwrite(str(path), crop if crop is not None else annotated)
 
         with session_scope() as s:
             s.add(Alert(
@@ -458,10 +662,10 @@ class CameraPipeline(threading.Thread):
         msg = (f"Intrusion Alert\nCamera: {self.camera['name']}\n"
                f"Zone: {ev.zone_name} ({ev.zone_type})\n"
                f"Object: {ev.label} #{ev.track_id}\nTime: {ts:%Y-%m-%d %H:%M:%S}")
-        
+
         # Build public image URL if public_url is configured in config.yaml
         public_base = CONFIG.get_path("system.public_url", "")
         img_url = f"{public_base.rstrip('/')}/snapshots/{fname}" if public_base else None
-        
+
         NOTIFIER.send(msg, img_url)
         print(f"[cam {ev.camera_id}] ALERT -- {ev.label} #{ev.track_id} @ {ev.zone_name}")

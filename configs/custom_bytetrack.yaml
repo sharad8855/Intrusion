@@ -1,0 +1,8 @@
+# Ultralytics ByteTrack tracker configuration
+tracker_type: bytetrack # tracker type, ['botsort', 'bytetrack']
+track_high_thresh: 0.5 # threshold for the first association
+track_low_thresh: 0.1 # threshold for the second association
+new_track_thresh: 0.6 # threshold for initiating a new track if the detection does not match any existing tracks
+track_buffer: 120 # buffer to keep lost tracks (increased from 30 to 120 to prevent track ID flickering)
+match_thresh: 0.8 # threshold for matching tracks
+fuse_score: True # (bool) Fuse detection score with motion/IoU for matching; stabilizes weak detections

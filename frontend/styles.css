@@ -290,12 +290,37 @@ input:focus, select:focus { outline: 1px solid var(--accent); }
   gap: 16px;
 }
 .alert-card {
+  position: relative;
   background: var(--panel);
   border: 1px solid var(--border);
   border-radius: 10px;
   overflow: hidden;
 }
-.alert-card img { width: 100%; display: block; aspect-ratio: 16/9; object-fit: cover; }
+.btn-delete-alert {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  background: rgba(15, 24, 37, 0.7);
+  backdrop-filter: blur(4px);
+  border: 1px solid var(--border);
+  color: var(--muted);
+  border-radius: 50%;
+  width: 28px;
+  height: 28px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  font-size: 12px;
+  transition: background .15s, color .15s, border-color .15s;
+  z-index: 10;
+}
+.btn-delete-alert:hover {
+  background: var(--danger);
+  color: #fff;
+  border-color: var(--danger);
+}
+.alert-card img { width: 100%; display: block; aspect-ratio: 16/9; object-fit: contain; background-color: var(--panel-2); }
 .alert-card .a-meta { padding: 10px 12px; font-size: 12px; }
 .alert-card .a-type {
   display: inline-block;

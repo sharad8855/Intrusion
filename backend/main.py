@@ -62,6 +62,11 @@ class ZoneIn(BaseModel):
     coordinates: dict
 
 
+class ZoneUpdateIn(BaseModel):
+    name: str | None = None
+    coordinates: dict | None = None
+
+
 # ── dashboard / static ───────────────────────────────────────────────
 @app.get("/")
 def dashboard():
@@ -238,6 +243,21 @@ def delete_zone(zone_id: int):
     return {"ok": True}
 
 
+@app.put("/api/zones/{zone_id}")
+def update_zone(zone_id: int, zone: ZoneUpdateIn):
+    with session_scope() as s:
+        obj = s.get(Zone, zone_id)
+        if not obj:
+            raise HTTPException(404, "zone not found")
+        if zone.name is not None:
+            obj.name = zone.name.strip()
+        if zone.coordinates is not None:
+            obj.coordinates = zone.coordinates
+        camera_id = obj.camera_id
+    MANAGER.reload_zones(camera_id)
+    return {"ok": True}
+
+
 # ── alerts ───────────────────────────────────────────────────────────
 @app.get("/api/alerts")
 def list_alerts(limit: int = 50, camera_id: int | None = None):
@@ -246,6 +266,62 @@ def list_alerts(limit: int = 50, camera_id: int | None = None):
         if camera_id is not None:
             q = q.filter(Alert.camera_id == camera_id)
         return [a.as_dict() for a in q.limit(limit).all()]
+
+
+@app.delete("/api/alerts/{alert_id}")
+def delete_alert(alert_id: int):
+    image_path = None
+    with session_scope() as s:
+        obj = s.get(Alert, alert_id)
+        if not obj:
+            raise HTTPException(404, "alert not found")
+        image_path = obj.image_path
+        s.delete(obj)
+    
+    if image_path:
+        try:
+            p = Path(image_path)
+            p.unlink(missing_ok=True)
+        except Exception as exc:
+            print(f"[main] alert {alert_id} file delete failed: {exc}")
+    return {"ok": True}
+
+
+@app.delete("/api/alerts")
+def delete_all_alerts():
+    # 1. Retrieve all non-null image paths from database first
+    image_paths = []
+    try:
+        with session_scope() as s:
+            image_paths = [a.image_path for a in s.query(Alert.image_path).filter(Alert.image_path != None).all()]
+    except Exception as db_err:
+        print(f"[main] bulk delete list images failed: {db_err}")
+
+    # 2. Delete the physical image files on disk outside database transaction
+    for path_str in image_paths:
+        if path_str:
+            try:
+                p = Path(path_str)
+                p.unlink(missing_ok=True)
+            except Exception as exc:
+                print(f"[main] bulk delete file failed for {path_str}: {exc}")
+
+    # Also make sure the entire snapshots directory is cleaned of any orphaned files
+    try:
+        snapshot_dir = Path(CONFIG.get_path("system.snapshot_dir"))
+        for img in snapshot_dir.glob("*"):
+            if img.is_file():
+                try:
+                    img.unlink(missing_ok=True)
+                except Exception as exc:
+                    print(f"[main] bulk delete cleanup file {img.name} failed: {exc}")
+    except Exception as exc:
+        print(f"[main] snapshot dir glob failed: {exc}")
+
+    # 3. Perform a single high-performance bulk delete query inside the database transaction
+    with session_scope() as s:
+        s.query(Alert).delete()
+    return {"ok": True}
 
 
 @app.exception_handler(Exception)

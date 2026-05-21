@@ -74,15 +74,15 @@ class RuleEngine:
             for z in zones
         ]
         self._line_side.clear()
+        self._last_alert.clear()
 
     # ── evaluation ───────────────────────────────────────────────────
     def evaluate(self, detections) -> list[IntrusionEvent]:
         events: list[IntrusionEvent] = []
         now = time.time()
         for det in detections:
-            cx, cy = det.centroid
             for zone in self.zones:
-                if self._triggered(zone, det.track_id, cx, cy):
+                if self._triggered(zone, det):
                     key = (zone.id, det.track_id)
                     if now - self._last_alert.get(key, 0) < self.cooldown:
                         continue
@@ -101,13 +101,42 @@ class RuleEngine:
                     )
         return events
 
-    def _triggered(self, zone: Zone, track_id: int, cx: int, cy: int) -> bool:
+    def _triggered(self, zone: Zone, det) -> bool:
+        # Line crossing is judged on the tracked centroid path.
         if zone.zone_type == "line":
-            return self._line_crossed(zone, track_id, cx, cy)
+            cx, cy = det.centroid
+            return self._line_crossed(zone, det.track_id, cx, cy)
+
+        # Area zones (circle / polygon): the object counts as "inside" when
+        # its feet, centroid, head, any of its four bounding box corners fall in the zone,
+        # or if the bounding box intersects the zone boundaries.
+        # This guarantees robust detection of sitting, stationary, or partially entering persons.
+        x1, y1, x2, y2 = det.xyxy
+        head = ((x1 + x2) // 2, y1)
+        anchors = (det.feet, det.centroid, head)
+        
         if zone.zone_type == "circle":
-            return self._in_circle(zone, cx, cy)
+            # Check anchors
+            if any(self._in_circle(zone, x, y) for x, y in anchors):
+                return True
+            # Check bounding box mathematical overlap with circle
+            c = zone.coords
+            closest_x = max(x1, min(c["cx"], x2))
+            closest_y = max(y1, min(c["cy"], y2))
+            return math.hypot(c["cx"] - closest_x, c["cy"] - closest_y) <= c["radius"]
+
         if zone.zone_type == "polygon":
-            return self._in_polygon(zone, cx, cy)
+            # Test centroid, feet, head, and the 4 corners of the bounding box
+            all_points = (
+                det.centroid,
+                det.feet,
+                head,
+                (x1, y1),
+                (x2, y1),
+                (x1, y2),
+                (x2, y2)
+            )
+            return any(self._in_polygon(zone, x, y) for x, y in all_points)
         return False
 
     # ── line: detect a side change of the tracked centroid ───────────

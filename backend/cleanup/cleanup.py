@@ -24,19 +24,47 @@ class CleanupEngine:
         self._scheduler = BackgroundScheduler(daemon=True)
 
     def _purge(self) -> None:
-        now = time.time()
+        from backend.database.db import session_scope
+        from backend.database.models import Alert
+        from datetime import datetime, timedelta
+
+        now_ts = time.time()
+        now_dt = datetime.utcnow()
+        cutoff_dt = now_dt - timedelta(seconds=self.retention_seconds)
+
         removed = 0
-        for img in self.snapshot_dir.glob("*"):
-            if not img.is_file():
-                continue
-            if now - img.stat().st_mtime > self.retention_seconds:
-                try:
-                    img.unlink()
+        try:
+            with session_scope() as s:
+                expired_alerts = s.query(Alert).filter(Alert.timestamp < cutoff_dt).all()
+                for alert in expired_alerts:
+                    if alert.image_path:
+                        try:
+                            p = Path(alert.image_path)
+                            p.unlink(missing_ok=True)
+                        except Exception as exc:
+                            print(f"[cleanup] could not delete image {alert.image_path}: {exc}")
+                    s.delete(alert)
                     removed += 1
-                except OSError as exc:
-                    print(f"[cleanup] could not delete {img.name}: {exc}")
-        if removed:
-            print(f"[cleanup] deleted {removed} expired snapshot(s).")
+        except Exception as db_exc:
+            print(f"[cleanup] database purge failed: {db_exc}")
+
+        # Also clean up any untracked or orphaned files in the snapshot directory that might have been left over
+        orphans_removed = 0
+        try:
+            for img in self.snapshot_dir.glob("*"):
+                if not img.is_file():
+                    continue
+                if now_ts - img.stat().st_mtime > self.retention_seconds:
+                    try:
+                        img.unlink()
+                        orphans_removed += 1
+                    except OSError as exc:
+                        print(f"[cleanup] could not delete orphaned {img.name}: {exc}")
+        except Exception as fs_exc:
+            print(f"[cleanup] file system purge failed: {fs_exc}")
+
+        if removed or orphans_removed:
+            print(f"[cleanup] purged {removed} database alert(s) and {orphans_removed} orphaned snapshot(s).")
 
     def start(self) -> None:
         self._purge()                          # run once immediately

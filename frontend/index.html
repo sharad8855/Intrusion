@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>AI Intrusion & Virtual Tripwire System</title>
-  <link rel="stylesheet" href="/static/styles.css" />
+  <link rel="stylesheet" href="/static/styles.css?v=1.0.3" />
 </head>
 <body>
 <div class="app">
@@ -189,7 +189,10 @@
           <h1>Intrusion Alerts</h1>
           <p>Captured evidence — auto-deleted after 2 hours.</p>
         </div>
-        <button class="btn ghost" id="alerts-refresh">⟳ Refresh</button>
+        <div style="display: flex; gap: 8px;">
+          <button class="btn ghost" id="alerts-refresh">⟳ Refresh</button>
+          <button class="btn danger" id="alerts-clear">🗑️ Clear All</button>
+        </div>
       </header>
       <div id="alerts-grid" class="alerts-grid"></div>
       <div id="alerts-empty" class="empty">No intrusion alerts yet.</div>
@@ -198,6 +201,6 @@
   </main>
 </div>
 
-<script src="/static/app.js"></script>
+<script src="/static/app.js?v=1.0.3"></script>
 </body>
 </html>

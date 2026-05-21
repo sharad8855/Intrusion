@@ -21,6 +21,9 @@ APScheduler>=3.10.0
 # Alerts
 requests>=2.31.0
 
+# Alert de-duplication (stops repeated photos of the same intrusion)
+redis>=5.0.0
+
 # Security — camera password encryption (Fernet/AES)
 cryptography>=42.0.0
 

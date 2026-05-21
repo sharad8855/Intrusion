@@ -23,7 +23,7 @@ _EXPORT_LOCK = threading.Lock()
 class Detection:
     """One tracked object in one frame."""
 
-    __slots__ = ("track_id", "cls_id", "label", "conf", "xyxy", "centroid")
+    __slots__ = ("track_id", "cls_id", "label", "conf", "xyxy", "centroid", "feet")
 
     def __init__(self, track_id, cls_id, label, conf, xyxy):
         self.track_id = track_id
@@ -33,6 +33,13 @@ class Detection:
         self.xyxy = xyxy                       # (x1, y1, x2, y2) ints
         x1, y1, x2, y2 = xyxy
         self.centroid = ((x1 + x2) // 2, (y1 + y2) // 2)
+        # Ground-contact point (feet) — the bottom-centre of the box.
+        # This is the correct anchor for deciding whether a person has
+        # stepped into a floor zone: the bbox CENTROID sits at torso
+        # height and, on a typical down-tilted CCTV view, projects ABOVE a
+        # circle/polygon drawn on the floor — so a centroid-only test
+        # misses real intrusions.
+        self.feet = ((x1 + x2) // 2, y2)
 
     def as_dict(self) -> dict:
         return {
@@ -42,6 +49,7 @@ class Detection:
             "conf": round(self.conf, 3),
             "bbox": list(self.xyxy),
             "centroid": list(self.centroid),
+            "feet": list(self.feet),
         }
 
 

@@ -30,8 +30,8 @@ device:
 
 # ── Detection model ──────────────────────────────────────────────────
 detection:
-  weights: "yolo11n.pt"       # n=nano (fastest) ... x=largest. CPU -> n/s.
-  confidence: 0.35
+  weights: "yolo26n.pt"       # n=nano (fastest) ... x=largest. CPU -> n/s. Supports YOLOv26.
+  confidence: 0.25
   iou: 0.5
   # Inference image size. Auto-tuned per device if left as "auto".
   imgsz: "auto"               # auto | 320 | 416 | 640 ...
@@ -50,19 +50,36 @@ optimization:
 
 # ── Tracking ─────────────────────────────────────────────────────────
 tracking:
-  tracker: "bytetrack.yaml"   # ByteTrack config bundled with ultralytics
+  tracker: "configs/custom_bytetrack.yaml"   # Custom ByteTrack config with 120-frame persistence buffer
 
 # ── Pipeline / performance ───────────────────────────────────────────
 pipeline:
   target_fps: 30              # processing FPS cap per camera
-  frame_skip: "auto"          # auto | 0 | 1 | 2 ... (drop frames if slow)
+  frame_skip: 0               # 0 = analyze every frame for absolute minimum lag
   # rtsp_transport is handled automatically: TCP is tried first, then UDP.
+  # RTSP ports are auto-scanned (554, 8554, 88, 10554) if the configured
+  # port does not answer.
   rtsp_timeout: 8             # seconds — socket timeout per connection attempt
   reconnect_delay: 5          # seconds before retrying a dropped stream
+  warmup_frames: 30           # decoder warm-up frames discarded on connect
+  max_grab_fails: 120         # consecutive read failures before reconnecting
+
+# ── Redis (alert de-duplication) ─────────────────────────────────────
+# Stops the same person's intrusion photo being sent again and again.
+# If Redis is unreachable the system automatically falls back to an
+# in-memory cache, so alerts still work.
+redis:
+  enabled: true
+  host: "150.241.245.84"
+  port: 6379
+  db: 0
+  password: ""
+  alert_dedup_seconds: 900    # suppresses the same tracked person from being captured again
+                              # within 5 minutes, while new individuals are captured instantly.
 
 # ── Alerts ───────────────────────────────────────────────────────────
 alerts:
-  cooldown_seconds: 15        # min gap between alerts for the same track
+  cooldown_seconds: 10        # min gap between alerts for the same track
   whatsapp:
     provider: "twilio"        # twilio | meta | webhook | disabled
     # --- Twilio ---

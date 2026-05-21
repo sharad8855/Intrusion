@@ -18,6 +18,8 @@ async function api(url, opts) {
 let cameras = [];          // [{id,name,status,running,...}]
 let pipelines = {};        // id -> {status,fps,...}
 let currentView = "live";
+let activeZones = [];      // cached zones for the selected camera
+let editingZoneId = null;  // active zone ID being updated
 
 /* ───────────────── NAVIGATION ───────────────── */
 $$(".nav-item").forEach((btn) =>
@@ -310,6 +312,8 @@ function resetDraw() {
   drawPoints = [];
   polyClosed = false;
   mousePos = null;
+  editingZoneId = null;
+  $("save-zone").textContent = "Save Zone";
   syncCanvas();
 }
 
@@ -333,6 +337,13 @@ function toNative(pt) {
   const sx = (feed.naturalWidth || feed.clientWidth || 1) / (feed.clientWidth || 1);
   const sy = (feed.naturalHeight || feed.clientHeight || 1) / (feed.clientHeight || 1);
   return [Math.round(pt[0] * sx), Math.round(pt[1] * sy)];
+}
+
+/* map a native point to canvas display-space coordinates */
+function toDisplay(pt) {
+  const sx = (feed.naturalWidth || feed.clientWidth || 1) / (feed.clientWidth || 1);
+  const sy = (feed.naturalHeight || feed.clientHeight || 1) / (feed.clientHeight || 1);
+  return [Math.round(pt[0] / sx), Math.round(pt[1] / sy)];
 }
 
 overlay.addEventListener("click", (e) => {
@@ -445,8 +456,17 @@ $("save-zone").addEventListener("click", async () => {
     coords = { x1: a[0], y1: a[1], x2: b[0], y2: b[1] };
   } else if (drawMode === "circle" && drawPoints.length === 2) {
     const c = toNative(drawPoints[0]);
-    const e = toNative(drawPoints[1]);
-    coords = { cx: c[0], cy: c[1], radius: Math.round(dist(c, e)) };
+    // Scale the radius by the horizontal display->native factor so it
+    // matches the cx/cy coordinate space. Measuring dist() between two
+    // separately x/y-scaled native points distorts the radius when the
+    // video is shown at a non-native size, which can place the circle
+    // off-target so intrusions are never detected.
+    const sx = (feed.naturalWidth || feed.clientWidth || 1) / (feed.clientWidth || 1);
+    coords = {
+      cx: c[0],
+      cy: c[1],
+      radius: Math.round(dist(drawPoints[0], drawPoints[1]) * sx),
+    };
   } else if (drawMode === "polygon" && drawPoints.length >= 3) {
     coords = { points: drawPoints.map(toNative) };
   } else {
@@ -454,15 +474,26 @@ $("save-zone").addEventListener("click", async () => {
   }
 
   try {
-    await api(`/api/cameras/${camId}/zones`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        zone_type: drawMode,
-        name: $("zone-name").value || drawMode + " zone",
-        coordinates: coords,
-      }),
-    });
+    if (editingZoneId) {
+      await api(`/api/zones/${editingZoneId}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          name: $("zone-name").value || drawMode + " zone",
+          coordinates: coords,
+        }),
+      });
+    } else {
+      await api(`/api/cameras/${camId}/zones`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          zone_type: drawMode,
+          name: $("zone-name").value || drawMode + " zone",
+          coordinates: coords,
+        }),
+      });
+    }
     $("zone-name").value = "";
     resetDraw();
     loadZones();
@@ -475,15 +506,19 @@ async function loadZones() {
   const camId = $("rule-cam").value;
   if (!camId) return;
   const zones = await api(`/api/cameras/${camId}/zones`);
+  activeZones = zones;
   $("zone-list").innerHTML = zones.length
     ? zones
         .map(
-          (z) => `<div class="zone-row">
+          (z) => `<div class="zone-row" data-id="${z.id}">
             <span>
               <span class="zone-badge zb-${z.zone_type}">${z.zone_type}</span>
               ${z.name}
             </span>
-            <button class="btn danger sm" data-zone="${z.id}">Remove</button>
+            <div style="display: flex; gap: 8px;">
+              <button class="btn sm edit-zone-btn" data-id="${z.id}">✏️ Edit</button>
+              <button class="btn danger sm remove-zone-btn" data-id="${z.id}">Remove</button>
+            </div>
           </div>`
         )
         .join("")
@@ -491,10 +526,59 @@ async function loadZones() {
 }
 
 $("zone-list").addEventListener("click", async (e) => {
-  const btn = e.target.closest("button[data-zone]");
-  if (!btn) return;
-  await api(`/api/zones/${btn.dataset.zone}`, { method: "DELETE" });
-  loadZones();
+  const editBtn = e.target.closest(".edit-zone-btn");
+  const removeBtn = e.target.closest(".remove-zone-btn");
+
+  if (editBtn) {
+    const id = parseInt(editBtn.dataset.id, 10);
+    const zone = activeZones.find(z => z.id === id);
+    if (!zone) return;
+
+    editingZoneId = zone.id;
+    $("zone-name").value = zone.name;
+
+    drawMode = zone.zone_type;
+    $$("#draw-tools .seg-btn").forEach((btn) => {
+      btn.classList.toggle("active", btn.dataset.mode === drawMode);
+    });
+
+    const sx = (feed.naturalWidth || feed.clientWidth || 1) / (feed.clientWidth || 1);
+
+    if (drawMode === "line") {
+      drawPoints = [
+        toDisplay([zone.coordinates.x1, zone.coordinates.y1]),
+        toDisplay([zone.coordinates.x2, zone.coordinates.y2])
+      ];
+    } else if (drawMode === "circle") {
+      const center = toDisplay([zone.coordinates.cx, zone.coordinates.cy]);
+      const radiusDisplay = zone.coordinates.radius / sx;
+      drawPoints = [
+        center,
+        [center[0] + radiusDisplay, center[1]]
+      ];
+    } else if (drawMode === "polygon") {
+      drawPoints = zone.coordinates.points.map(pt => toDisplay(pt));
+      polyClosed = true;
+    }
+
+    $("save-zone").textContent = "✏️ Update Zone";
+    $("draw-hint").textContent = `Editing: Redraw coordinates on the video feed or change the name, then click 'Update Zone'.`;
+    redraw();
+  }
+
+  if (removeBtn) {
+    const id = removeBtn.dataset.id;
+    if (!confirm("Are you sure you want to delete this zone?")) return;
+    try {
+      await api(`/api/zones/${id}`, { method: "DELETE" });
+      if (editingZoneId === parseInt(id, 10)) {
+        resetDraw();
+      }
+      loadZones();
+    } catch (err) {
+      alert("Error deleting zone: " + err.message);
+    }
+  }
 });
 
 /* ───────────────── ALERTS ───────────────── */
@@ -508,7 +592,8 @@ async function loadAlerts() {
       const file = a.image_path
         ? a.image_path.replace(/\\/g, "/").split("/").pop()
         : null;
-      return `<div class="alert-card">
+      return `<div class="alert-card" data-id="${a.id}">
+        <button class="btn-delete-alert" data-id="${a.id}" title="Delete alert">🗑️</button>
         ${file ? `<img src="/snapshots/${file}" alt="evidence" />` : ""}
         <div class="a-meta">
           <span class="a-type">${a.alert_type}</span><br/>
@@ -520,6 +605,31 @@ async function loadAlerts() {
     .join("");
 }
 $("alerts-refresh").addEventListener("click", loadAlerts);
+
+// Click delegation for deleting individual alerts
+$("alerts-grid").addEventListener("click", async (e) => {
+  const btn = e.target.closest(".btn-delete-alert");
+  if (!btn) return;
+  const alertId = btn.dataset.id;
+  if (!confirm("Are you sure you want to delete this alert?")) return;
+  try {
+    await api(`/api/alerts/${alertId}`, { method: "DELETE" });
+    loadAlerts();
+  } catch (err) {
+    alert("Error deleting alert: " + err.message);
+  }
+});
+
+// Click handler for clearing all alerts
+$("alerts-clear").addEventListener("click", async () => {
+  if (!confirm("Are you sure you want to clear all alerts? This will delete all snapshot images on disk permanently.")) return;
+  try {
+    await api("/api/alerts", { method: "DELETE" });
+    loadAlerts();
+  } catch (err) {
+    alert("Error clearing alerts: " + err.message);
+  }
+});
 
 /* ───────────────── BOOT / POLLING ───────────────── */
 async function tick() {
